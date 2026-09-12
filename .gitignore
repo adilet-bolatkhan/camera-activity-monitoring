@@ -9,3 +9,4 @@ project_monitoring.py
 providers.xlsx
 esvm_project_history.sqlite3
 *.swp
+*.sqlite3
