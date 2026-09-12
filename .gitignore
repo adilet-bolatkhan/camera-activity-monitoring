@@ -8,4 +8,4 @@ cron_debug.log
 project_monitoring.py
 providers.xlsx
 esvm_project_history.sqlite3
-camera_history.sqlite3
+*.swp
