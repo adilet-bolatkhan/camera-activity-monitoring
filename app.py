@@ -1,33 +1,19 @@
 """
-Мониторинг активности камер.
+Каждый запуск скрипта забирает текущий снимок (total/active камер)
+и парсит его так же, как ваш сервис (prometheus_client.parser).
+"Норма" задаётся ВРУЧНУЮ в ENVIRONMENT_NORMS — доля активных камер
+от общего числа камер по окружению (например, 0.74). Итоговая
+норма в штуках = доля * текущий total.
+Если текущее значение активных камер упало относительно нормы на
+DROP_THRESHOLD (10%) и более — шлём алерт в Google Chat.
+Повторно алерт по одному и тому же окружению НЕ шлётся, пока
+проблема не устранится и не возникнет снова — статус хранится в
+таблице alert_state в SQLite (camera_history.sqlite3), с гистерезисом
+через DROP_THRESHOLD/RECOVERY_THRESHOLD (см. ниже).
 
-Источник данных — те же эндпоинты, что в CAMERA_METRICS_BY_DOMAIN вашего
-FastAPI-сервиса (http://<host>:8000/), отдающие СЫРОЙ Prometheus exposition
-format (см. parse_cameras_metrics в вашем сервисе). Это НЕ JSON API
-VictoriaMetrics (/api/v1/query) — просто текущий снимок метрик без истории.
-
-Поэтому:
-    1. Каждый запуск скрипта забирает текущий снимок (total/active камер)
-       и парсит его так же, как ваш сервис (prometheus_client.parser).
-    2. Снимок сохраняется в локальную SQLite (camera_history.sqlite3) —
-       так со временем накапливается история для расчёта нормы.
-    3. "Норма" = среднее количество активных камер за последние NORM_DAYS
-       дней, взятое в районе того же времени суток (окно ±TIME_TOLERANCE_MIN
-       минут), — то есть скользящее среднее с поправкой на дневной цикл.
-    4. Если текущее значение активных камер упало относительно нормы на
-       DROP_THRESHOLD (10%) и более — шлём алерт в Google Chat.
-
-ВАЖНО: скрипт должен запускаться регулярно и часто (например, раз в
-10-15 минут через cron), чтобы:
-  а) вовремя ловить падения активности;
-  б) накапливать историю в SQLite, из которой считается норма.
-Первые NORM_DAYS дней после первого запуска норма будет "н/д" —
-это ожидаемо, истории ещё не накопилось.
-
-Если у вас ЕСТЬ отдельная настоящая VictoriaMetrics с длинным ретеншеном,
-которая скрейпит эти же эндпоинты, — расчёт нормы лучше делать через её
-query_range API (это надёжнее и не зависит от локального файла на сервере).
-Скажите мне адрес и путь такого API, и я перепишу vm_active_norm под него.
+ВАЖНО: для окружения, для которого не задана норма в ENVIRONMENT_NORMS,
+алерты не проверяются вообще (нет базы для сравнения) — впишите долю
+вручную для каждого нужного окружения.
 """
 
 import os
@@ -68,6 +54,15 @@ logger.addHandler(_console_handler)
 #                        КОНФИГУРАЦИЯ
 # ============================================================
 
+# Порог для ВОССТАНОВЛЕНИЯ — должен быть меньше DROP_THRESHOLD. Это
+# гистерезис: если норма ~1000, а активных то 899, то 901, то 899 -
+# без зазора между "заалертить" и "восстановить" статус будет дёргаться
+# туда-сюда на паре камер. Поэтому выйти из алерта можно только когда
+# падение опустится НИЖЕ RECOVERY_THRESHOLD (а не просто ниже DROP_THRESHOLD).
+# Пока падение между RECOVERY_THRESHOLD и DROP_THRESHOLD — статус не
+# меняется (остаётся тем, каким был).
+
+RECOVERY_THRESHOLD = 0.05    # восстановление засчитывается при падении <=5%
 DROP_THRESHOLD = 0.2        # порог падения активности, при котором шлём алерт (10%)
 TIME_TOLERANCE_MIN = 30       # окно совпадения "того же времени суток" (используется только для тренда в --test-send)
 REQUEST_TIMEOUT = 15          # таймаут запроса к metrics-эндпоинту, сек
@@ -80,7 +75,7 @@ CHAT_WEBHOOK_URL = "https://chat.googleapis.com/v1/spaces/AAQAeQLcWDk/messages?k
 # росте/сокращении парка камер.
 # Если для окружения норма не задана — алерты по нему не проверяются
 # (нет базы для сравнения), в отчёте будет "н/д".
-#   "Атырау": 0.74  — ожидаем стабильно ~74% камер активными (45к из 61к)
+# "ЕСВМ Алматы": 0.74  — ожидаем стабильно ~74% камер активными (45к из 61к)
 ENVIRONMENT_NORMS = {
     "ЕСВМ Алматы": 0.74,
     "ЕСВМ Атырау": 0.81,
@@ -100,8 +95,7 @@ ENVIRONMENTS = [
 
 DB_PATH = Path(__file__).parent / "camera_history.sqlite3"
 
-# Слать recovery-уведомление ("✅ восстановилось"), когда сущность
-# переходит из ALERT обратно в OK. Если не нужно - поставьте False.
+# Слать recovery-уведомление, когда сущность переходит из ALERT обратно в OK. Если не нужно - то написать False.
 ENABLE_RECOVERY_NOTIFICATIONS = True
 
 
@@ -112,31 +106,12 @@ ENABLE_RECOVERY_NOTIFICATIONS = True
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS snapshots (
-            environment TEXT NOT NULL,
-            ts INTEGER NOT NULL,      -- unix timestamp запроса
-            total INTEGER NOT NULL,
-            active INTEGER NOT NULL
-        )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_env_ts ON snapshots(environment, ts)")
-    conn.execute("""
         CREATE TABLE IF NOT EXISTS alert_state (
             entity TEXT PRIMARY KEY,
             status TEXT NOT NULL,     -- 'ok' | 'alert'
             updated_ts INTEGER NOT NULL
         )
     """)
-    conn.commit()
-    conn.close()
-
-
-def save_snapshot(environment: str, ts: float, total: int, active: int):
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "INSERT INTO snapshots (environment, ts, total, active) VALUES (?, ?, ?, ?)",
-        (environment, int(ts), total, active),
-    )
     conn.commit()
     conn.close()
 
@@ -164,30 +139,46 @@ def set_alert_status(entity: str, status: str, ts: float):
 
 def process_alert_states(results: list, now_ts: float):
     """
-    Сравнивает текущий статус (alert/ok) каждого окружения с последним
-    сохранённым и обновляет состояние. Возвращает (new_alerts, recovered):
+    Сравнивает текущее падение активности каждого окружения с последним
+    сохранённым статусом и обновляет состояние. Используется гистерезис
+    (см. DROP_THRESHOLD/RECOVERY_THRESHOLD выше): войти в alert можно
+    только при падении >= DROP_THRESHOLD, а выйти обратно в ok — только
+    при падении <= RECOVERY_THRESHOLD. Пока значение "болтается" между
+    этими порогами, статус не меняется — это защищает от дребезга
+    алерт/восстановление на паре камер туда-сюда.
+
+    Возвращает (new_alerts, recovered):
       - new_alerts  — сущности, у которых ТОЛЬКО ЧТО начался алерт
                        (был ok/неизвестно -> стал alert). Только они уходят в чат.
       - recovered   — сущности, которые ТОЛЬКО ЧТО вышли из алерта
                        (был alert -> стал ok).
     Если статус не изменился (alert->alert или ok->ok) — сущность НЕ
     попадает ни в один из списков, повторный алерт не шлётся.
-    Окружения с ошибкой получения данных (entry["Статус"]) не трогают
-    состояние алертов вообще.
+    Окружения с ошибкой получения данных (entry["Статус"]) или без
+    заданной нормы (entry["_drop_ratio"] is None) не трогают состояние.
     """
     new_alerts, recovered = [], []
     for entry in results:
         if entry.get("Статус"):
             continue
 
+        drop_ratio = entry.get("_drop_ratio")
+        if drop_ratio is None:
+            continue  # нет нормы - не с чем сравнивать, состояние не трогаем
+
         name = entry["Проект"]
-        is_alert_now = bool(entry.get("alert"))
-        current_status = "alert" if is_alert_now else "ok"
         last_status = get_last_alert_status(name)
 
-        if is_alert_now and last_status != "alert":
+        if last_status == "alert":
+            # Уже в алерте - выходим только при уверенном восстановлении
+            current_status = "alert" if drop_ratio > RECOVERY_THRESHOLD else "ok"
+        else:
+            # Были в ok (или это первый запуск) - входим в алерт по обычному порогу
+            current_status = "alert" if drop_ratio >= DROP_THRESHOLD else "ok"
+
+        if current_status == "alert" and last_status != "alert":
             new_alerts.append(entry)
-        elif not is_alert_now and last_status == "alert":
+        elif current_status == "ok" and last_status == "alert":
             recovered.append(entry)
 
         set_alert_status(name, current_status, now_ts)
@@ -205,59 +196,6 @@ def get_norm(environment: str, total: int):
     if share is None:
         return None
     return share * total
-
-
-def get_history_trend(environment: str, now_ts: float, days: int = 7,
-                       tolerance_min: int = TIME_TOLERANCE_MIN):
-    """
-    Возвращает список (день_смещение, дата, active) за последние `days`
-    дней, включая сегодня (offset=0) — по одному ближайшему снапшоту
-    на день. Используется для тестовой отправки/визуализации тренда.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    trend = []
-    for day_offset in range(days, -1, -1):  # от старых к новым, включая сегодня
-        target_ts = now_ts - day_offset * 86400
-        low = target_ts - tolerance_min * 60
-        high = target_ts + tolerance_min * 60
-        cur = conn.execute(
-            """
-            SELECT active, ts FROM snapshots
-            WHERE environment = ? AND ts BETWEEN ? AND ?
-            ORDER BY ABS(ts - ?) ASC
-            LIMIT 1
-            """,
-            (environment, low, high, target_ts),
-        )
-        row = cur.fetchone()
-        date_label = datetime.fromtimestamp(target_ts).strftime("%d.%m")
-        if row:
-            trend.append((day_offset, date_label, row[0]))
-        else:
-            trend.append((day_offset, date_label, None))
-    conn.close()
-    return trend
-
-
-def generate_trend_message(results: list, now_ts: float, days: int = 7) -> str:
-    """Тестовое сообщение: текущий снимок + тренд активных камер за N дней."""
-    message = f"🧪 Тестовая сводка — активные камеры за последние {days} дней:\n"
-    for entry in results:
-        name = entry["Проект"]
-        message += f"\nПроект: {name}\n"
-        if entry.get("Статус"):
-            message += f"Статус: {entry['Статус']}\n"
-            continue
-
-        trend = get_history_trend(name, now_ts, days=days)
-        points = []
-        for day_offset, date_label, active in trend:
-            label = "сегодня" if day_offset == 0 else date_label
-            points.append(f"{label}: {active if active is not None else 'н/д'}")
-        message += "  " + " | ".join(points) + "\n"
-        message += f"Сейчас активных: {entry['Активные камеры']} из {entry['Общее количество камер']}\n"
-        message += f"Норма: {entry['Норма активных камер']}\n"
-    return message
 
 
 # ============================================================
@@ -290,7 +228,6 @@ def fetch_cameras(metrics_url: str) -> list[dict]:
 def process_environment(env: dict) -> dict:
     name = env["name"]
     metrics_url = env["metrics_url"]
-    now_ts = time.time()
 
     entry = {"Проект": name}
 
@@ -307,10 +244,6 @@ def process_environment(env: dict) -> dict:
 
     logger.info(f"[{name}] OK: получено {total} камер, активных {active}, архивных {archive}")
 
-    # Сохраняем снапшот — используется только для тренда в --test-send,
-    # на расчёт нормы и алерты больше не влияет
-    save_snapshot(name, now_ts, total, active)
-
     norm_active = get_norm(name, total)
 
     entry.update({
@@ -323,6 +256,7 @@ def process_environment(env: dict) -> dict:
     if norm_active and norm_active > 0:
         drop_ratio = (norm_active - active) / norm_active
         entry["Падение от нормы, %"] = round(drop_ratio * 100, 1)
+        entry["_drop_ratio"] = drop_ratio  # для гистерезиса в process_alert_states
 
         if drop_ratio >= DROP_THRESHOLD:
             entry["alert"] = (
@@ -331,6 +265,7 @@ def process_environment(env: dict) -> dict:
             )
     else:
         entry["Падение от нормы, %"] = "н/д"
+        entry["_drop_ratio"] = None
         entry["Примечание"] = f"Норма не задана вручную для «{name}» в ENVIRONMENT_NORMS — алерт не проверяется"
         logger.info(f"[{name}] Норма не задана вручную — алерт по этому окружению не проверяется")
 
@@ -383,7 +318,18 @@ def generate_recovery_message(recovered: list):
 #                      ОТПРАВКА В CHAT
 # ============================================================
 
-def send_to_chat(message: str):
+def send_to_chat(message: str, silent: bool = False):
+    """
+    silent=True — режим dry-run: сообщение не отправляется, только
+    логируется (первые ~200 символов) как "было бы отправлено". Состояние
+    алертов (alert_state) при этом всё равно обновляется как обычно —
+    иначе после выхода из тихого режима гистерезис/антиспам собьётся.
+    """
+    if silent:
+        preview = message[:200].replace("\n", " ")
+        logger.info(f"[SILENT] Сообщение НЕ отправлено (dry-run): {preview}...")
+        return
+
     headers = {"Content-Type": "application/json"}
     payload = {"text": message}
     try:
@@ -401,21 +347,23 @@ def send_to_chat(message: str):
 def main():
     parser = argparse.ArgumentParser(description="Мониторинг активности камер")
     parser.add_argument(
-        "--test-send", action="store_true",
-        help="Собрать текущий снимок + тренд за 7 дней и отправить в чат "
-             "независимо от того, сработал алерт или нет (для проверки вебхука и парсинга).",
+        "--report", action="store_true",
+        help="Отправить полный отчёт по всем окружениям в чат вместо проверки алертов "
+             "(удобно для разовой проверки вебхука и парсинга).",
     )
     parser.add_argument(
-        "--report", action="store_true",
-        help="Отправить полный отчёт (как в --test-send, но без тренда) вместо проверки алертов.",
+        "--silent", action="store_true",
+        help="Тихий режим (dry-run): все проверки и запись состояния алертов "
+             "выполняются как обычно, но сообщения в чат НЕ отправляются — "
+             "только логируются. Полезно для отладки без спама в чат.",
     )
     args = parser.parse_args()
 
     start_time = time.time()
     init_db()
 
-    mode = "test-send" if args.test_send else ("report" if args.report else "alert-check")
-    logger.info(f"=== Запуск скрипта, режим={mode}, окружений={len(ENVIRONMENTS)} ===")
+    mode = "report" if args.report else "alert-check"
+    logger.info(f"=== Запуск скрипта, режим={mode}, silent={args.silent}, окружений={len(ENVIRONMENTS)} ===")
 
     with ThreadPoolExecutor(max_workers=len(ENVIRONMENTS)) as executor:
         results = list(executor.map(process_environment, ENVIRONMENTS))
@@ -425,28 +373,24 @@ def main():
 
     now_ts = time.time()
 
-    if args.test_send:
-        message = generate_trend_message(results, now_ts, days=7)
-        send_to_chat(message)
-        logger.info("Тестовое сообщение отправлено.")
-    elif args.report:
+    if args.report:
         message = generate_report_message(results)
-        send_to_chat(message)
+        send_to_chat(message, silent=args.silent)
     else:
         new_alerts, recovered = process_alert_states(results, now_ts)
 
         alert_message = generate_alert_message(new_alerts)
         if alert_message:
-            send_to_chat(alert_message)
-            logger.info(f"Алерт отправлен: новых просадок — {len(new_alerts)}.")
+            send_to_chat(alert_message, silent=args.silent)
+            logger.info(f"Алерт {'(silent) ' if args.silent else ''}отправлен: новых просадок — {len(new_alerts)}.")
         else:
             logger.info("Новых просадок нет (либо активность в норме, либо проблема уже зафиксирована ранее).")
 
         if ENABLE_RECOVERY_NOTIFICATIONS:
             recovery_message = generate_recovery_message(recovered)
             if recovery_message:
-                send_to_chat(recovery_message)
-                logger.info(f"Отправлено уведомление о восстановлении: {len(recovered)}.")
+                send_to_chat(recovery_message, silent=args.silent)
+                logger.info(f"Отправлено {'(silent) ' if args.silent else ''}уведомление о восстановлении: {len(recovered)}.")
 
     duration = time.time() - start_time
 
